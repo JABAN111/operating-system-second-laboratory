@@ -3,7 +3,7 @@
 #include <string>
 #include <vector>
 
-#include "../lab2.h"
+#include <lab2.h>
 
 #define BLOCK_SIZE (8192)
 
@@ -16,8 +16,8 @@ void io_thpt_read_cache_test(const string& filename, size_t num_blocks, int repe
     size_t cache_size = 10;
     cache_init(cache_size);
     for(int i = 0; i < repetitions; ++i) {
-        int fd = lab2_open(filename.c_str());
-        if(fd == -1) {
+        auto fd_inot = lab2_open(filename.c_str());
+        if(fd_inot.first == -1) {
             cerr << "ERROR: Не удалось открыть файл" << filename << endl;
             exit(EXIT_FAILURE);
         }
@@ -25,7 +25,8 @@ void io_thpt_read_cache_test(const string& filename, size_t num_blocks, int repe
         size_t bytesRead = 0;
         auto start = chrono::high_resolution_clock::now();
         for(size_t j = 0; j < num_blocks; j++) {
-            ssize_t readSize = lab2_read(fd, buffer.data(), BLOCK_SIZE);
+            off_t offset = lab2_lseek(fd_inot.first, 0, SEEK_CUR);
+            ssize_t readSize = lab2_read(fd_inot, buffer.data(), BLOCK_SIZE, offset);
             if(readSize <= 0) {
                 break;
             }
@@ -37,15 +38,14 @@ void io_thpt_read_cache_test(const string& filename, size_t num_blocks, int repe
         double bandwidth = (bytesRead / 1024.0/1024.0) / diff.count();
         total_bandwidth += bandwidth;
         cout << "Прочитано " << bytesRead / 1024 << "Кб за " << diff.count() << " секунд " << endl;
-        lab2_fsync(fd);
-        lab2_close(fd);
-
+        lab2_fsync(fd_inot.first);
+        lab2_close(fd_inot.first);
     }
     cache_free();
     cout << "Средняя пропускная способность за " << repetitions << " повторений: " << total_bandwidth / repetitions << "MB/s" << endl;
 }
 
-int ma2n(int argc, char* argv[]) {
+int main(int argc, char* argv[]) {
     if(argc != 4) {
         cerr << "ERROR: Неверно введённые параметры" << endl;
         return 1;

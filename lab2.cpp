@@ -2,7 +2,12 @@
 #include <fcntl.h>
 #include <cstring>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <unordered_map>
+#include <list>
+#include <utility>
 #include "lab2.h"
+#include <algorithm>
 
 using namespace std;
 
@@ -14,245 +19,162 @@ int cache_init(size_t size) {
 }
 
 void cache_free() {
-
-    for(auto &entry: cache.table) {
-        if(entry.second && entry.second->data) {
-            cout << "Освобождение блока со сдвигом = " << entry.second->offset << " и адресом данных" << static_cast<void*>(entry.second->data) << endl;
-            free(entry.second->data);
-            entry.second->data = nullptr;
-            delete entry.second;
-        }
-    }
-
     cache.table.clear();
     cache.usage_list.clear();
-    // cout << "Кэш очищен" << endl;
 }
 
 void display_cache() {
-    cout << "Содержимое таблицы кэша: " << endl;
-    for(const auto &entry : cache.table) {
-        const CacheBlock* block = entry.second;
-        cout << "Сдвиг: " <<block->offset
-             << "Размер: " << block->size
-             << "Адрес данных: " << static_cast<void*>(block->data) << endl;
+    cout << "Содержимое кэша:\n";
+    for (const auto &entry: cache.table) {
+        const auto &block = entry.second;
+        cout << "inode: " << block.inode
+                << ", offset: " << block.offset
+                << ", size: " << block.size << '\n';
     }
-    cout << "Общее кол-во блоков в кэше: " << cache.table.size() << endl;
 }
 
-
-/**
- *
- */
 void evict_block_lru() {
-    if(cache.usage_list.empty()) {
-        return;
+    if (cache.usage_list.empty()) return;
+
+    auto oldest = cache.usage_list.front();
+    cache.usage_list.pop_front();
+
+    auto it = cache.table.find(oldest);
+    if (it != cache.table.end()) {
+        auto block = it->second;
+        free(block.data);
+        cache.table.erase(it);
+        cout << "Удален блок с inode: " << block.inode << ", offset: " << block.offset << endl;
     }
-    off_t offset = cache.usage_list.front();// берем указатель на самый старый блок
-    // cout << "Eviction block at " << offset << endl;
-    free(cache.table[offset]->data);
-    delete cache.table[offset];//Удаление данных блока из памяти
-    cache.table.erase(offset);//Удаление записи из хэш-таблицы
-    cache.usage_list.pop_front();//Удаление блока из списка LRU
+}
+
+CacheBlock &find_cache_block(ino_t inode, off_t offset) {
+    auto key = std::make_pair(inode, offset);
+
+    auto it = cache.table.find(key);
+    if (it != cache.table.end()) {
+        cache.usage_list.remove(key);
+        cache.usage_list.push_back(key);
+        return it->second;
+    }
+
+    throw std::runtime_error("Cache block not found");
 }
 
 
-/**
- * Функция обертка над обычным системным lseek,
- * который управляет позицией указателя при работе с файлами
- *
- * @param fd file descriptor
- * @param offset на сколько сместить
- * @param whence в случае данной лабораторной работы принимает только значения `SEEK_CUR` - переместиться на offset от текущей позиции и `SEEK_SET` - переместиться на позицию offset от начала файла.
- * @return
- */
 off_t lab2_lseek(int fd, off_t offset, int whence) {
-    off_t fixedOffset = lseek(fd, offset, whence);
-    if(fixedOffset == -1) {
-        cerr << "PANIC: lseek file!!!" << endl;
-        return -1;
-    }
-    return fixedOffset;
+    return lseek(fd, offset, whence);
 }
 
-int lab2_open(const char *path) {
-    // Задает режим работы с файлом, чтобы работал наш собственный механизм кэша
-    // В данном случае используется комбинация двух флагов:
-    // O_RDWR          0x0002          /* open for reading and writing */
-    // O_DIRECT direct io, обходя файловый кэш оси
-    // constexpr int flags = O_RDWR | O_DIRECT;
-    // int fd = open(path, flags);
-
-    // Задает режим работы с файлом
-    constexpr int flags = O_RDWR | O_DIRECT | O_CREAT;
-    // Устанавливает права доступа для нового файла (например, rw-r--r--)
-    // constexpr mode_t mode = 0644;
-
-    int fd = open(path, flags);//, mode);
-
-
-
-    if(fd == -1) {
-        cerr << "PANIC: open file!!!" << endl;
+pair<int, ino_t> lab2_open(const char *path) {
+    constexpr int flags = O_RDWR | O_DIRECT;
+    int fd = open(path, flags);
+    if (fd == -1) {
+        cerr << "Ошибка открытия файла\n";
+        return {-1, -1};
     }
 
-    cout << "Open success with descriptor: " << fd << endl;
-    return fd;
-}
-
-int lab2_close(const int fd) {
-    const int result = close(fd);
-    if(result < 0) {
-        cerr << "PANIC: close file!!!" << endl;
-    }
-    // cout << "Close success" << endl;
-    return result;
-}
-
-
-/**
- * Выделяет память, выровненную по заданному объему памяти
- * Гарантирует, что адрес выделенного блока кратен значению alignment.
- *
- *  По факту является просто оберткой над стандартной `posix_memalign`
- *
- * @param alignment Задает требуемое выравнивание памяти
- * @param size Указывает размер выделяемой области памяти.
- *
- * @return Возвращает указатель на выделенную память
- */
-void* aligned_alloc(size_t alignment, size_t size) {
-    void* aligned_buf = nullptr;
-
-    int ret = posix_memalign(&aligned_buf, alignment, size);
-
-    if(ret != 0) {
-        cerr << "PANIC: in align_alloc!!!" << endl;
-        return nullptr;
+    struct stat file_stat;
+    if (fstat(fd, &file_stat) == -1) {
+        close(fd);
+        cerr << "Ошибка получения inode\n";
+        return {-1, -1};
     }
 
-    // cout << "Aligned memory success, return: "  << aligned_buf << endl;
-    return aligned_buf;
+    return {fd, file_stat.st_ino};
 }
 
-CacheBlock* find_cache_block(off_t offset) {
-    auto iterator = cache.table.find(offset);
-    if(iterator != cache.table.end()) {
-        cache.usage_list.remove(offset);
-        cache.usage_list.push_back(offset);
-        // cout << "Find cache success";
-        return iterator->second;
-    }
-    return nullptr;
+int lab2_close(int fd) {
+    return close(fd);
 }
 
-ssize_t lab2_read(int fd, void* buf, size_t count) {
-    off_t offset = lab2_lseek(fd, 0, SEEK_CUR);
-    if(offset == -1) {
-        cerr << "PANIC: lseek in rad!!!" << endl;
+ssize_t lab2_read(pair<int, ino_t> fd_inot, void *buf, size_t count, off_t offset) {
+    if (offset == -1) {
+        cerr << "PANIC: lseek invalid" << endl;
         return -1;
     }
 
-    CacheBlock *block = find_cache_block(offset);
+    try {
+        CacheBlock &block = find_cache_block(fd_inot.second, offset);
 
-
-    //если нашли блок памяти, то записали туда всю информацию
-    if(block && block->size >= count) {
-        cout << "found block with size: " << block->size << endl;
-        memcpy(buf, block->data, count);
-        return count;
+        if (block.size >= count) {
+            memcpy(buf, block.data, count);
+            return count;
+        }
+    } catch (const std::runtime_error &e) {
+        cerr << e.what() << endl;
     }
 
     void *aligned_buf = aligned_alloc(512, count);
-    if(!aligned_buf) {
+    if (!aligned_buf) {
         return -1;
     }
 
-    ssize_t bytesRead = read(fd, aligned_buf, count);
-    if(bytesRead == -1) {
+    ssize_t bytesRead = read(fd_inot.first, aligned_buf, count);
+    if (bytesRead == -1) {
         cerr << "PANIC: read file!!!" << endl;
         free(aligned_buf);
         return -1;
     }
 
-    if(cache.table.size() >= cache.size) {
+
+    if (cache.table.size() >= cache.size) {
         evict_block_lru();
     }
 
-    if(cache.table.find(offset) == cache.table.end()) {
-        auto addBlock = new CacheBlock();
-        addBlock->offset = offset;
-        addBlock->size = bytesRead;
-        addBlock->data = static_cast<char*>(aligned_buf);
-        cache.table[offset] = addBlock;
-        cache.usage_list.push_back(offset);
-        cout << "Add cache success in read" << endl;
-    }else {
+    if (cache.table.find({fd_inot.second, offset}) == cache.table.end()) {
+        CacheBlock addBlock{fd_inot.second, offset, static_cast<size_t>(bytesRead), static_cast<char *>(aligned_buf)};
+        cache.table[{fd_inot.second, offset}] = addBlock;
+        cache.usage_list.push_back({fd_inot.second, offset});
+    } else {
         free(aligned_buf);
     }
+
     return bytesRead;
 }
 
-ssize_t lab2_write(int fd, const void* buf, size_t count) {
-    off_t offset = lab2_lseek(fd, 0, SEEK_CUR);
-    cout << "offset in write: " << offset << endl;
 
-    if(offset == -1) {
-        cerr << "PANIC: lseek in write" << endl;
-        return -1;
-    }
+ssize_t lab2_write(pair<int, ino_t> fd_inot, off_t offset, const void *buf, size_t count) {
+    void *aligned_buf = aligned_alloc(512, count);
+    if (!aligned_buf) return -1;
 
-    void* aligned_buf = aligned_alloc(512, count);//выравниванием адрес на кратный 512
+    memcpy(aligned_buf, buf, count);
+    ssize_t bytesWritten = pwrite(fd_inot.first, aligned_buf, count, offset);
+    free(aligned_buf);
 
-    if(!aligned_buf) {
-        cerr << "PANIC: to allocate memory" << endl;
-        return -1;
-    }
+    if (bytesWritten == -1) return -1;
 
-    memcpy(aligned_buf, buf, count);//копирует данные из исходного в выровненный
-    const ssize_t bytesWritten = write(fd, aligned_buf, count);
-    if(bytesWritten < 0) {
-        cerr << "PANIC: write in file failed" << endl;
-        free(aligned_buf);
-        return -1;
-    }
+    if (cache.table.size() >= cache.size) evict_block_lru();
 
-    //проверка заполненности кэша
-    if(cache.table.size() >= cache.size) {
-        evict_block_lru();
-    }
+    auto key = make_pair(fd_inot.second, offset);
 
-
-    auto iterator = cache.table.find(offset);
-
-    if(iterator == cache.table.end()) {
-        auto* addBlock = new CacheBlock();
-        addBlock->offset = offset;
-        addBlock->size = count;
-        addBlock->data = static_cast<char*>(aligned_buf);
-        cache.table[offset] = addBlock;
-        cache.usage_list.push_back(offset);
-    }else {
-        free(aligned_buf);
+    if (cache.table.find(key) == cache.table.end()) {
+        CacheBlock newBlock{fd_inot.second, offset, static_cast<size_t>(bytesWritten), nullptr};
+        newBlock.data = static_cast<char *>(malloc(bytesWritten));
+        if (!newBlock.data) {
+            return -1;
+        }
+        memcpy(newBlock.data, buf, bytesWritten);
+        cache.table[key] = newBlock;
+        cache.usage_list.push_back(key);
     }
 
     return bytesWritten;
 }
 
-int lab2_fsync(int fd)
-{
-    for(auto& entry : cache.table) {
-        CacheBlock* block = entry.second;
-        ssize_t bytesWritten = pwrite(fd, block->data, block->size, block->offset);
-        if(bytesWritten != static_cast<ssize_t>(block->size)) {
-            cerr << "PANIC: fsync write!!!" << block->offset << endl;
-            return -1;
+int lab2_fsync(int fd) {
+    struct stat file_stat;
+    if (fstat(fd, &file_stat) == -1) return -1;
+
+    for (auto it = cache.table.begin(); it != cache.table.end();) {
+        auto &block = it->second;
+        if (block.inode == file_stat.st_ino) {
+            pwrite(fd, block.data, block.size, block.offset);
+            it = cache.table.erase(it);
+        } else {
+            ++it;
         }
     }
-    if(fsync(fd) == -1) {
-        cerr << "PANIC: fsync!!!" << endl;
-        return -1;
-    }
-    cout << "Данные успешно синхронизированы с диском" << endl;
-    return 0;
+
+    return fsync(fd);
 }
